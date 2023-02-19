@@ -1,6 +1,7 @@
 mod config;
 mod db;
-use rocket::{get, post, request::{FromRequest, Request, Outcome}, async_trait};
+use rocket::{get, post, request::{FromRequest, Request, Outcome}, async_trait, response::Response};
+use serde_json::json;
 
 struct Authenticated(bool);
 
@@ -22,10 +23,7 @@ impl<'r> FromRequest<'r> for Authenticated {
 #[get("/fetch")]
 async fn fetch_email(auth: Authenticated) {
     if auth.0 {
-        // return {
-        //     'success': False,
-        //     'message': 'Not authenticated'
-        // }, 401
+        
     }
 
     // let data = db::fetch_email().await;
