@@ -1,8 +1,9 @@
-use std::{sync::atomic::AtomicUsize, path::PathBuf};
+use std::{path::PathBuf, net::{IpAddr, Ipv4Addr}};
 
-use rocket::{get, post, serde::json::{json, Value, Json}, http::Status, routes, Ignite, Rocket};
+use cassandra_cpp::Session;
+use rocket::{get, post, serde::json::{json, Value, Json}, http::Status, routes, Rocket, Build, Config};
 
-use crate::{params::{Authenticated, Params}, db::{Keyspace, init, Combo}};
+use crate::{params::{Authenticated, Params}, db::{Keyspace, Combo}, config::CONFIG};
 
 fn failure(code: u16, message: &str) -> (Status, Value) {
     let status = unsafe { Status::from_code(code).unwrap_unchecked() };
@@ -82,12 +83,14 @@ fn invalidate(auth: Authenticated, keyspace: Keyspace<'_>, _path: PathBuf, body:
     }
 }
 
-#[rocket::main]
-pub async fn rocket() -> Result<Rocket<Ignite>, rocket::Error> {
-    let session = unsafe { init() };
+pub async fn init(session: &'static Session) -> Rocket<Build> {
+    let mut config = Config::default();
+    config.address = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+    config.port = 80;
+    config.workers = CONFIG.settings.rest_threads;
+
     rocket::build()
+        .configure(config)
         .manage(session)
         .mount("/", routes![fetch, add, invalidate])
-        .launch()
-        .await
 }

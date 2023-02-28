@@ -1,14 +1,11 @@
-use std::{sync::atomic::{AtomicUsize, Ordering}, fs::metadata};
+use std::{sync::atomic::{AtomicUsize, Ordering}};
 
-use cassandra_cpp::{Session, stmt, Result, Ssl, SslVerifyFlag, Cluster, Error};
+use cassandra_cpp::{Session, stmt, Result, Ssl, SslVerifyFlag, Cluster, Error, UuidGen};
 use rand::{thread_rng, Rng};
-use rocket::{request::{FromRequest, Outcome}, async_trait, tokio, http::Status, serde::{json::{json, Value}, Serialize}};
+use rocket::{request::{FromRequest, Outcome}, async_trait, tokio::{self, fs::{read_to_string, metadata}}, http::Status, serde::{json::{json, Value}, Serialize}};
 use tokio::main as sync;
 
-use crate::config::CASSANDRA;
-
-type Uuid = String;
-type Inet = String;
+use crate::config::CONFIG;
 
 pub struct Combo {
     pub email: String,
@@ -17,32 +14,16 @@ pub struct Combo {
 
 #[derive(Serialize)]
 pub struct FullCombo {
-    email: CassandraValue,
-    password: CassandraValue,
-    params: CassandraValue,
-    id: CassandraValue,
+    email: String,
+    password: String,
+    params: String,
+    id: String,
 }
 
 #[derive(Serialize)]
 pub struct FullComboPayload {
     data: Option<Vec<FullCombo>>,
     errors: Option<Vec<String>>,
-}
-
-#[derive(Serialize)]
-pub enum CassandraValue {
-    Bytes(Vec<u8>),
-    Float32(f32),
-    Float64(f64),
-    Int8(i8),
-    Int16(i16),
-    Int32(i32),
-    Int64(i64),
-    UnsignedInt(u32),
-    String(String),
-    Inet(Inet),
-    Uuid(Uuid),
-    Unknown,
 }
 
 pub struct Keyspace<'a> {
@@ -62,29 +43,32 @@ impl<'r> FromRequest<'r> for Keyspace<'r> {
     async fn from_request(request: &'r rocket::Request<'_>) ->  Outcome<Self, Self::Error> {
         
         let session = request.rocket().state::<Session>().unwrap();
-        let rr = match request.uri().path().segments().last() {
+        let keyspace = match request.uri().path().segments().last() {
             Some(last_seg) => last_seg,
             None => "email"
         };
+        let keyspace = Keyspace::from(session, keyspace);
+
+        Outcome::Success(keyspace)
+    }
+}
+
+impl<'a> Keyspace<'a> {
+    pub fn from(session: &'a Session, keyspace: &str) -> Self {
         let (keyspace, index) = unsafe {
-            match rr {
+            match keyspace {
                 "discord" => ("discord", &mut DISCORD_INDEX),
                 "valid" => ("valid", &mut VALID_EMAIL_INDEX),
                 "email" | _ => ("email", &mut EMAIL_INDEX),
             }
         };
-        let full_keyspace = Keyspace {
+        Keyspace {
             keyspace, session, index
-        };
-        
-        Outcome::Success(full_keyspace)
-        // ;todo!()
+        }
     }
-}
 
-impl<'a> Keyspace<'a> {
     fn get_table(&mut self) -> (String, usize) {
-        let new_index = if self.index.get_mut() >= &mut CASSANDRA.total_tables {
+        let new_index = if self.index.get_mut() >= &mut CONFIG.cassandra.total_tables.clone() {
             0
         } else {
             self.index.get_mut().clone() + 1
@@ -110,8 +94,7 @@ impl<'a> Keyspace<'a> {
             Ok(_) => println!("Created keyspace {}", self.keyspace),
         }
 
-        for i in 0..CASSANDRA.total_tables {
-            //combos.t
+        for i in 0..CONFIG.cassandra.total_tables {
             let table_name = format!("{}.t{}", self.keyspace, i);
             println!("Creating table {table_name}...");
             let statement = stmt!(&format!("CREATE TABLE IF NOT EXISTS {table_name} (id text PRIMARY KEY, email text, passw text, lastcheck timestamp, p text)"));
@@ -120,15 +103,15 @@ impl<'a> Keyspace<'a> {
                 Err(err) => eprintln!("Failed to create table {table_name}: {err}"),
             }
         }
-        // print('Created all tables')
+
         println!("Created all tables")
     }
 
-    fn get_table_by_uuid(&self, id: Uuid) -> String {
+    fn get_table_by_uuid(&self, id: String) -> String {
         format!("{}.t{}", self.keyspace, id.split("-").nth(0).unwrap())
     }
 
-    async fn add(&self, query: String, added: i32) -> Option<Error> {
+    async fn add(&self, query: String) -> Option<Error> {
         let statement = stmt!(&query);
         self.session.execute(&statement).await.err()
     }
@@ -137,8 +120,6 @@ impl<'a> Keyspace<'a> {
     pub async fn add_combos(&mut self, combos: Vec<Combo>, params: &str) -> Option<Vec<String>> {
         let mut query = "BEGIN BATCH\n".to_string();
         let mut added = 0;
-        //#print('Adding ' + str(added) + ' combos...')
-        //^put this somewhere
 
         let mut errors = Vec::new();
 
@@ -148,15 +129,17 @@ impl<'a> Keyspace<'a> {
             added += 1;
 
             if query.len() > 49500 {
-                if let Some(err) = self.add(query.clone(), added).await {
-                    errors.push(format!("failed to add {added} combos into {}: {err}", self.keyspace))
+                match self.add(query.clone()).await {
+                    Some(err) => errors.push(format!("failed to add {added} combos into {}: {err}", self.keyspace)),
+                    None => println!("added {added} combos"),
                 }
                 added = 0;
                 query = "BEGIN BATCH\n".to_string();
             }
         }
-        if let Some(err) = self.add(query.clone(), added).await {
-            errors.push(format!("failed to add {added} combos into {}: {err}", self.keyspace))
+        match self.add(query.clone()).await {
+            Some(err) => errors.push(format!("failed to add {added} combos into {}: {err}", self.keyspace)),
+            None => println!("added {added} combos"),
         }
 
         if errors.is_empty() {
@@ -166,26 +149,15 @@ impl<'a> Keyspace<'a> {
         }
     }
 
-    async fn add_email(&mut self, Combo{ email, password }: Combo, params: &str,) {
-        let (table, i) = self.get_table();
-        let statement = format!(
-            "INSERT INTO {table} (email, passw, lastcheck, p, id)
-            VALUES ({email}, {password}, {0}, {params}, {})",
-            generate_id(i)
-        );
-        let statement = stmt!(&statement);
-        self.session.execute(&statement).await.unwrap();
-    }
-
     #[sync]
     pub async fn fetch_email(&mut self) -> (Status, Value) {
         let (table, _) = self.get_table();
 
         let statement = format!(
             "SELECT * FROM {table}
-        LIMIT 1000
+        LIMIT {}
         ALLOW FILTERING
-        "
+        ", CONFIG.settings.batch_size
         );
         let statement = stmt!(&statement);
 
@@ -200,13 +172,13 @@ impl<'a> Keyspace<'a> {
         let mut data = Vec::new();
         let mut errors = Vec::new();
 
-        for i in 0..1000 {
+        for i in 0..CONFIG.settings.batch_size {
             let Some(row) = emails.get(i) else { continue; };
             
             macro_rules! get {
                 ($name:literal) => {
-                    match row.get_column_by_name($name).and_then(convert) {
-                        Ok(val) => val,
+                    match row.get_column_by_name($name) {
+                        Ok(val) => val.to_string(),
                         Err(err) => {
                             errors.push(format!("{}", err));
                             continue;
@@ -220,8 +192,9 @@ impl<'a> Keyspace<'a> {
             let params = get!("p");
             let id = get!("id");
 
-            let combo = FullCombo { email, password, params, id };
+            let combo = FullCombo { email, password, params, id: id.to_owned() };
             data.push(combo);
+            self.invalidate_combo(id);
         }
         
         match (data.is_empty(), errors.is_empty()) {
@@ -242,13 +215,13 @@ impl<'a> Keyspace<'a> {
                 }))
             }
             (true, true) => {
-                (Status::ImATeapot, json!("There're no errors... but no data either.... What???? This error should be infalible, but just to be sure, I'm putting a 418 status code on it"))
+                (Status::ImATeapot, json!("There're no errors... but no data either.... What???? This error should be infalible, but just to be sure, I'm putting a very serious 418 status code on it"))
             }
         }
     }
 
     #[sync]
-    pub async fn invalidate_combo(&self, id: Uuid) -> Option<Error> {
+    pub async fn invalidate_combo(&self, id: String) -> Option<Error> {
         let table = self.get_table_by_uuid(id.clone());
         let statement = format!("DELETE FROM {table} WHERE id = '{}'", sanitize(id));
         let statement = stmt!(&statement);
@@ -260,30 +233,44 @@ fn sanitize<S: AsRef<str>>(input: S) -> String {
     input.as_ref().replace("'", "''")
 }
 
-fn generate_id(i: usize) -> Uuid {
-    let r = &uuid::Uuid::new_v4().to_string().replace("-", "")[..8];
-    format!("{}-{}", i, r)
+fn generate_id(i: usize) -> String {
+    format!("{}-{}", i, &UuidGen::default().gen_random().to_string().replace("-", "")[..8])
 }
 
-async fn connect() -> Result<Session> {
-    if metadata("aws.cert").is_ok() {
-        Ssl::default().set_verify_flags(&[SslVerifyFlag::PEER_CERT]);
-    }
+pub async fn connect() -> Result<Session> {
 
+    let config = CONFIG.cassandra;
     let mut cluster = Cluster::default();
-    cluster
-        .set_port(CASSANDRA.port)?
-        .set_contact_points(CASSANDRA.nodes[0])?
-        .set_credentials(CASSANDRA.username, CASSANDRA.password)?
-        // .set_ssl(ssl)
+    let session_builder = cluster
+        .set_port(config.port)?
+        .set_contact_points(&config.nodes[0])?
+        .set_credentials(&config.username,&config.password)?;
+
+    add_cert(session_builder).await;
+
+    let session = session_builder
         .connect_async()
-        .await
+        .await?;
+    
+    unsafe { init(&session) };
+    
+    Ok(session)
+}
+
+async fn add_cert(session_builder: &mut Cluster) {
+    if metadata("aws.cert").await.is_ok() {
+        let Ok(cert) = read_to_string("aws.cert").await else { return; };
+
+        let mut ssl = Ssl::default();
+        let ssl = ssl.add_trusted_cert(&cert);
+        let Ok(mut ssl) = ssl else { return; };
+        ssl.set_verify_flags(&[SslVerifyFlag::PEER_CERT]);
+        session_builder.set_ssl(&mut ssl);
+    }
 }
 
 #[sync]
-pub async unsafe fn init() -> Session {
-    let session = connect().await.expect("");
-
+async unsafe fn init(session: &Session) {
     let keyspace_contexts = [
         ("discord", &mut DISCORD_INDEX), 
         ("valid", &mut VALID_EMAIL_INDEX), 
@@ -291,42 +278,12 @@ pub async unsafe fn init() -> Session {
     ];
 
     for (keyspace, index) in keyspace_contexts {
-        let keyspace = Keyspace { keyspace, session: &session, index };
+        let keyspace = Keyspace { keyspace, session, index };
         keyspace.create_table_if_not_exists().await
     }
 
-    DISCORD_INDEX = thread_rng().gen_range(0..CASSANDRA.total_tables).into();
-    EMAIL_INDEX = thread_rng().gen_range(0..CASSANDRA.total_tables).into();
-    VALID_EMAIL_INDEX = thread_rng().gen_range(0..CASSANDRA.total_tables).into();
-
-    session
+    DISCORD_INDEX = thread_rng().gen_range(0..CONFIG.cassandra.total_tables).into();
+    EMAIL_INDEX = thread_rng().gen_range(0..CONFIG.cassandra.total_tables).into();
+    VALID_EMAIL_INDEX = thread_rng().gen_range(0..CONFIG.cassandra.total_tables).into();
 }
 
-fn convert(val: cassandra_cpp::Value) -> Result<CassandraValue> {
-    macro_rules! _if {
-        ($($_fn:ident, $_type:ident $(,$otherfn:ident)?);*) => {
-            $(
-                if let Ok(x) = val.$_fn() {
-                    return Ok(CassandraValue::$_type(x$(.$otherfn())?));
-                }
-            )*
-        };
-    }
-
-    _if!(
-        get_f32, Float32;
-        get_f64, Float64;
-        get_i8, Int8;
-        get_i16, Int16;
-        get_i32, Int32;
-        get_i64, Int64;
-        get_u32, UnsignedInt;
-        get_string, String;
-        get_inet, Inet, to_string;
-        get_uuid, Uuid, to_string;
-        get_bytes, Bytes, to_vec
-    );
-    let err = Error::from_kind("could not read value in table as acceptable type".into());
-    
-    Err(err)
-}
